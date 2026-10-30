@@ -31,7 +31,7 @@ from pathlib import Path
 SITE = "https://www.pokemonsleep.net"
 LIST = SITE + "/en/news/page/{}/"
 POST = SITE + "/en/news/{}/"
-PAGES = 2
+PAGES = 3  # 15 posts: more than ever come out between hourly runs
 STATE = Path(__file__).resolve().parent / "posted.json"
 KEEP = 300
 LIMIT = 2000  # Discord message content limit
@@ -320,25 +320,37 @@ def parse_post(page: str) -> dict:
     }
 
 
+# Where a message may end, best first: before a new section, before a dropdown,
+# between paragraphs, between lines, after a sentence, between words.
+_BREAKS = (r"\n\n(?=#{1,3} )", r"\n\n(?=> \*\*)", r"\n\n", r"\n", r"(?<=[.!?])\s", r"\s")
+
+
+def _cut_point(text: str) -> int:
+    """End of the next message: the best kind of break in the back half of what
+    fits, so messages break naturally without coming out tiny."""
+    for pattern in _BREAKS:
+        cuts = [m.start() for m in re.finditer(pattern, text[: LIMIT + 1]) if LIMIT // 2 <= m.start() <= LIMIT]
+        if cuts:
+            cut = cuts[-1]
+            # A heading or bold subheading at the end moves with the text it introduces.
+            last = text.rfind("\n\n", 0, cut)
+            if last >= LIMIT // 2 and re.fullmatch(r"#.*|\*\*[^\n]*\*\*", text[last + 2:cut].strip()):
+                cut = last
+            return cut
+    return LIMIT
+
+
 def _split(text: str) -> list[str]:
-    """Pieces of at most LIMIT characters, cut at blank lines, then lines, then spaces."""
+    """Messages of at most LIMIT characters, broken at natural points (_BREAKS)."""
     chunks = []
     while len(text) > LIMIT:
-        cut = -1
-        for sep in ("\n\n", "\n", " "):
-            cut = text.rfind(sep, 0, LIMIT)
-            if cut > LIMIT // 2:
-                break
-        if cut <= 0:
-            cut = LIMIT
-        # A heading at the end moves with the text it introduces.
-        last = text.rfind("\n\n", 0, cut)
-        if last > LIMIT // 4 and re.match(r"#|\*\*[^\n]*\*\*$", text[last + 2:cut].strip()):
-            cut = last
+        cut = _cut_point(text)
         head, text = text[:cut].rstrip(), text[cut:].lstrip("\n ")
         if head.count("**") % 2:  # don't leave bold open across messages
             head += "**"
             text = "**" + text
+        if head.split("\n")[-1].startswith(">") and text and not text.startswith(">"):
+            text = "> " + text  # a dropdown split mid-line stays quoted
         chunks.append(head)
     if text.strip():
         chunks.append(text)
@@ -385,18 +397,73 @@ def send(webhook: str, payload: dict) -> None:
     raise RuntimeError("Discord kept rate limiting")
 
 
-def post_one(post_id: str, webhook: str | None) -> None:
+def preview(post_id: str) -> None:
     post = parse_post(fetch(POST.format(post_id)))
     messages = to_messages(post_id, post)
-    if not webhook:
-        print(f"===== {post['title']} ({len(messages)} messages)")
-        for m in messages:
-            print(m.get("content") or f"[image] {m['embeds'][0]['image']['url']}")
-            print("-----")
-        return
+    print(f"===== {post['title']} ({len(messages)} messages)")
     for m in messages:
-        send(webhook, m)
-    print(f"posted: {post['title']} ({len(messages)} messages)")
+        print(m.get("content") or f"[image] {m['embeds'][0]['image']['url']}")
+        print("-----")
+
+
+def post_one(post_id: str, webhook: str, start: int = 0, sent=lambda n: None) -> int:
+    """Sends a post's messages from `start` on, calling sent(n) after each, so a run
+    that stops partway resumes there instead of repeating the start. Returns the count."""
+    post = parse_post(fetch(POST.format(post_id)))
+    messages = to_messages(post_id, post)
+    for n in range(start, len(messages)):
+        send(webhook, messages[n])
+        sent(n + 1)
+    print(f"posted: {post['title']} ({len(messages) - start} messages)")
+    return len(messages)
+
+
+# posted.json: {"posted": [ids, oldest first], "partial": {id: messages sent},
+# "failures": {id: failed runs}}. A post failing MAX_TRIES runs in a row is skipped.
+MAX_TRIES = 3
+
+
+def load_state() -> dict | None:
+    if not STATE.exists():
+        return None
+    state = json.loads(STATE.read_text())
+    return {"posted": state.get("posted", []), "partial": state.get("partial", {}), "failures": state.get("failures", {})}
+
+
+def save_state(state: dict) -> None:
+    state["posted"] = state["posted"][-KEEP:]
+    STATE.write_text(json.dumps(state, indent=1, sort_keys=True) + "\n")
+
+
+def run(listed: list[dict], state: dict, webhook: str, save=save_state) -> int:
+    """Sends every listed post not yet posted, oldest first; a burst of posts goes
+    out in order, one post after another. Returns how many failed."""
+    new = [p for p in reversed(listed) if p["id"] not in state["posted"]]
+    failed = 0
+    for p in new:
+        pid = p["id"]
+        def sent(n, pid=pid):
+            state["partial"][pid] = n
+            save(state)
+        try:
+            post_one(pid, webhook, state["partial"].get(pid, 0), sent)
+        except Exception as e:  # the others still go out; this one is retried next run
+            failed += 1
+            tries = state["failures"][pid] = state["failures"].get(pid, 0) + 1
+            if tries >= MAX_TRIES:
+                print(f"skipped after {tries} failed runs: {p['title']}: {e}", file=sys.stderr)
+                state["posted"].append(pid)
+                state["partial"].pop(pid, None)
+            else:
+                print(f"failed ({tries}/{MAX_TRIES}), retrying next run: {p['title']}: {e}", file=sys.stderr)
+            save(state)
+            continue
+        state["posted"].append(pid)
+        state["partial"].pop(pid, None)
+        state["failures"].pop(pid, None)
+        save(state)
+    print(f"{len(new) - failed} posted, {failed} failed" if new else "no new posts")
+    return failed
 
 
 def main() -> int:
@@ -406,12 +473,12 @@ def main() -> int:
     ap.add_argument("--latest", type=int, metavar="N", help="post the N newest posts, ignoring posted.json")
     ap.add_argument("--seed", action="store_true", help="mark every listed post as posted, send nothing")
     args = ap.parse_args()
-    webhook = None if args.dry_run else os.environ.get("NEWS_WEBHOOK_URL")
+    webhook = os.environ.get("NEWS_WEBHOOK_URL")
     if not webhook and not args.dry_run and not args.seed:
         print("NEWS_WEBHOOK_URL is not set (use --dry-run to preview)", file=sys.stderr)
         return 1
     if args.post:
-        post_one(args.post, webhook)
+        preview(args.post) if args.dry_run else post_one(args.post, webhook)
         return 0
 
     listed = []
@@ -422,29 +489,22 @@ def main() -> int:
         return 1
     if args.latest:
         for p in reversed(listed[: args.latest]):  # oldest of them first
-            post_one(p["id"], webhook)
+            preview(p["id"]) if args.dry_run else post_one(p["id"], webhook)
         return 0
-    seen = json.loads(STATE.read_text()) if STATE.exists() else None
-    if seen is None or args.seed:
-        seen = sorted({p["id"] for p in listed} | set(seen or []))
+    state = load_state()
+    if state is None or args.seed:
+        state = state or {"posted": [], "partial": {}, "failures": {}}
+        state["posted"] += [p["id"] for p in reversed(listed) if p["id"] not in state["posted"]]
         if not args.dry_run:
-            STATE.write_text(json.dumps(seen[-KEEP:], indent=1) + "\n")
-        print(f"seeded {len(seen)} posts; new ones from now on get posted")
+            save_state(state)
+        print(f"recorded {len(state['posted'])} existing posts; new ones from now on get posted")
         return 0
-    new = [p for p in reversed(listed) if p["id"] not in seen]  # oldest first
-    failed = 0
-    for p in new:
-        try:
-            post_one(p["id"], webhook)
-        except Exception as e:  # keep going; this one is retried next run
-            failed += 1
-            print(f"failed: {p['title']}: {e}", file=sys.stderr)
-            continue
-        if not args.dry_run:
-            seen.append(p["id"])
-            STATE.write_text(json.dumps(seen[-KEEP:], indent=1) + "\n")
-    print(f"{len(new) - failed} posted, {failed} failed" if new else "no new posts")
-    return 1 if failed else 0
+    if args.dry_run:
+        for p in reversed(listed):
+            if p["id"] not in state["posted"]:
+                preview(p["id"])
+        return 0
+    return 1 if run(listed, state, webhook) else 0
 
 
 if __name__ == "__main__":

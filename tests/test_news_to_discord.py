@@ -122,6 +122,84 @@ class SplitTests(unittest.TestCase):
             self.assertEqual(chunk.count("**") % 2, 0)
 
 
+class SplitChoiceTests(unittest.TestCase):
+    def test_prefers_a_section_break_over_a_later_paragraph_break(self):
+        para = "word " * 70  # ~350 characters
+        text = "\n\n".join([para] * 3 + ["## Section", para] + [para] * 3)
+        first = news._split(text)[0]
+        self.assertTrue(first.endswith(para.strip()))
+        self.assertNotIn("## Section", first)
+
+    def test_long_paragraph_breaks_after_a_sentence(self):
+        text = ("This is a sentence. " * 150).strip()
+        chunks = news._split(text)
+        self.assertTrue(all(len(c) <= news.LIMIT for c in chunks))
+        self.assertTrue(chunks[0].endswith("."))
+
+    def test_dropdown_stays_quoted_when_split_mid_line(self):
+        text = "> **Notes**\n> " + "A long note sentence here. " * 120
+        chunks = news._split(text)
+        self.assertTrue(all(c.startswith(">") for c in chunks))
+
+
+class RunTests(unittest.TestCase):
+    """Several new posts at once, a send that stops partway, and a post that keeps failing."""
+
+    def setUp(self):
+        self.sent = []          # (post id, message index)
+        self.broken = set()     # post ids whose sends fail
+        self.stop_after = {}    # post id -> fail after this many messages, once
+        self.saves = 0
+
+        def post_one(post_id, webhook, start=0, sent=lambda n: None):
+            for n in range(start, 3):  # every fake post is 3 messages
+                if post_id in self.broken or self.stop_after.get(post_id) == n:
+                    self.stop_after.pop(post_id, None)
+                    raise RuntimeError("Discord 500")
+                self.sent.append((post_id, n))
+                sent(n + 1)
+            return 3
+        self.real, news.post_one = news.post_one, post_one
+
+    def tearDown(self):
+        news.post_one = self.real
+
+    def save(self, state):
+        self.saves += 1
+
+    def listing(self, *ids):  # newest first, like the site
+        return [{"id": i, "title": i, "category": ""} for i in ids]
+
+    def test_burst_goes_out_oldest_first_each_post_whole(self):
+        state = {"posted": ["old"], "partial": {}, "failures": {}}
+        failed = news.run(self.listing("c", "b", "a", "old"), state, "hook", self.save)
+        self.assertEqual(failed, 0)
+        self.assertEqual(self.sent, [(i, n) for i in ("a", "b", "c") for n in range(3)])
+        self.assertEqual(state["posted"], ["old", "a", "b", "c"])
+        # Nothing is sent twice on the next run.
+        self.sent = []
+        news.run(self.listing("c", "b", "a", "old"), state, "hook", self.save)
+        self.assertEqual(self.sent, [])
+
+    def test_a_post_stopped_partway_resumes_without_repeating(self):
+        state = {"posted": [], "partial": {}, "failures": {}}
+        self.stop_after["a"] = 2
+        self.assertEqual(news.run(self.listing("b", "a"), state, "hook", self.save), 1)
+        self.assertEqual(state["partial"], {"a": 2})
+        self.assertEqual(state["posted"], ["b"])  # the next post still went out
+        news.run(self.listing("b", "a"), state, "hook", self.save)
+        self.assertEqual([m for m in self.sent if m[0] == "a"], [("a", 0), ("a", 1), ("a", 2)])
+        self.assertEqual(state, {"posted": ["b", "a"], "partial": {}, "failures": {}})
+
+    def test_a_post_that_keeps_failing_is_skipped_after_three_runs(self):
+        state = {"posted": [], "partial": {}, "failures": {}}
+        self.broken.add("a")
+        for _ in range(news.MAX_TRIES):
+            news.run(self.listing("a"), state, "hook", self.save)
+        self.assertIn("a", state["posted"])
+        self.assertEqual(self.sent, [])
+
+
 class ListingTests(unittest.TestCase):
     def test_listing(self):
         self.assertEqual(news.parse_listing(LISTING), [

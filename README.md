@@ -9,7 +9,9 @@ Each post becomes a run of messages in page order:
 - every dropdown (the tap-to-open "Notes", "Expert Mode Bonuses" and so on), opened up as a quote block under its bold headline
 - each image, where it appears in the post
 
-Messages stay under Discord's 2,000-character limit, split between paragraphs, never leaving a heading or bold text dangling. Nobody gets pinged, and links don't unfurl previews.
+Text past Discord's 2,000-character limit continues in the next message, broken at the most natural point that fits: before a new section, before a dropdown, between paragraphs, between lines, then after a sentence. A heading never ends a message apart from its text. Nobody gets pinged, and links don't unfurl previews.
+
+Each post is sent once. When several come out together, they go out oldest first, one whole post after another. If Discord fails partway through a post, the next run picks up at the message it stopped on instead of repeating the start; a post that fails three runs in a row is skipped so it can't hold up the rest.
 
 ## Setup
 
