@@ -1,0 +1,59 @@
+# Copies new official Pokémon Sleep news posts into Discord, word for word.
+# Hourly; posted.json (committed back) remembers what was sent. The first run
+# only records what's already there, so the channel isn't flooded.
+# Secret: NEWS_WEBHOOK_URL (the channel's webhook: Edit Channel > Integrations > Webhooks).
+# Run it by hand to test: "post_id" (one post) or "latest" (the N newest), neither
+# of which touches posted.json, or "dry_run" to only print.
+name: News to Discord
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      post_id:
+        description: "Post this news post (the long number in its URL)"
+        required: false
+      latest:
+        description: "Post the N newest posts"
+        required: false
+      dry_run:
+        description: "Only print what would be sent"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: news
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Post news
+        env:
+          NEWS_WEBHOOK_URL: ${{ secrets.NEWS_WEBHOOK_URL }}
+          POST_ID: ${{ inputs.post_id }}
+          LATEST: ${{ inputs.latest }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=()
+          [ "$DRY_RUN" = "true" ] && args+=(--dry-run)
+          if [ -n "$POST_ID" ]; then args+=(--post "$POST_ID")
+          elif [ -n "$LATEST" ]; then args+=(--latest "$LATEST"); fi
+          python3 news_to_discord.py "${args[@]}"
+      - name: Save what was posted
+        if: always()
+        run: |
+          git add posted.json 2>/dev/null || exit 0
+          git diff --cached --quiet && exit 0
+          git -c user.name="github-actions[bot]" -c user.email="41898283+github-actions[bot]@users.noreply.github.com" commit -m "Posted news"
+          git push
+      - name: Run tests
+        if: github.event_name == 'workflow_dispatch'
+        run: python3 -m unittest discover -s tests
