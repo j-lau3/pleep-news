@@ -2,7 +2,8 @@
 # Hourly; posted.json (committed back) remembers what was sent. The first run
 # only records what's already there, so the channel isn't flooded.
 # Secret: NEWS_WEBHOOK_URL (the channel's webhook: Edit Channel > Integrations > Webhooks).
-# Variables (optional): NEWS_PING_ROLE_ID, NEWS_IMAGES=on.
+# Optional: NEWS_PING_ROLE_ID, NEWS_IMAGES=off; events need secret DISCORD_BOT_TOKEN and
+# variables DISCORD_GUILD_ID, NEWS_EVENT_INVITE, NEWS_EVENT_TZ (see README).
 # Run it by hand to test: "post_id" (one post) or "latest" (the N newest), neither
 # of which touches posted.json, or "dry_run" to only print.
 name: News to Discord
@@ -39,9 +40,14 @@ jobs:
       - name: Post news
         env:
           NEWS_WEBHOOK_URL: ${{ secrets.NEWS_WEBHOOK_URL }}
-          # Optional repository variables: the role pinged under each title, and NEWS_IMAGES=on to also send images.
+          # Optional: the role pinged under each title; NEWS_IMAGES=off to leave images out.
           NEWS_PING_ROLE_ID: ${{ vars.NEWS_PING_ROLE_ID }}
           NEWS_IMAGES: ${{ vars.NEWS_IMAGES }}
+          # Optional: a bot (webhooks can't create events) turns each Event Period into a Discord event.
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_GUILD_ID: ${{ vars.DISCORD_GUILD_ID }}
+          NEWS_EVENT_INVITE: ${{ vars.NEWS_EVENT_INVITE }}
+          NEWS_EVENT_TZ: ${{ vars.NEWS_EVENT_TZ }}
           POST_ID: ${{ inputs.post_id }}
           LATEST: ${{ inputs.latest }}
           DRY_RUN: ${{ inputs.dry_run }}

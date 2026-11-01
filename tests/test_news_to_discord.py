@@ -109,14 +109,54 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(messages[0]["allowed_mentions"], {"parse": [], "roles": ["1167529296332595291"]})
         self.assertLessEqual(len(content), news.LIMIT)
 
-    def test_no_ping_unless_configured_and_images_only_when_on(self):
-        with patch.dict(os.environ, {"NEWS_PING_ROLE_ID": "", "NEWS_IMAGES": "on"}):
+    def test_images_ride_on_the_first_message_and_no_ping_unless_configured(self):
+        with patch.dict(os.environ, {"NEWS_PING_ROLE_ID": "", "NEWS_IMAGES": ""}):
             messages = news.to_messages("123", self.post)
         self.assertNotIn("<@&", messages[0]["content"])
         self.assertEqual(messages[0]["allowed_mentions"], {"parse": []})
-        self.assertEqual([m["embeds"][0]["image"]["url"] for m in messages if "embeds" in m], [
+        self.assertEqual([e["image"]["url"] for e in messages[0]["embeds"]], [
             "https://view.sleep.pokemon.co.jp/news/image/1/Halloween.jpg",
             "https://view.sleep.pokemon.co.jp/news/image/1/second.png"])
+        self.assertNotIn("flags", messages[0], "embed suppression would hide the images")
+        with patch.dict(os.environ, {"NEWS_IMAGES": "off"}):
+            self.assertNotIn("embeds", news.to_messages("123", self.post)[0])
+
+    def test_event_period_and_link(self):
+        self.assertEqual(self.post["period"], (1792987200, 1793591999))
+        messages = news.to_messages("123", self.post, "https://discord.gg/pokemonsleep?event=42")
+        self.assertTrue(messages[-1]["content"].endswith("\n\nhttps://discord.gg/pokemonsleep?event=42"))
+
+    def test_event_uses_local_wall_clock_in_the_configured_zone(self):
+        with patch.dict(os.environ, {"NEWS_EVENT_TZ": "America/New_York"}):
+            e = news.event_payload("123", self.post, now=1792000000)
+        # Oct. 26 at 4:00 a.m. New York time (EDT), not 4:00 UTC.
+        self.assertEqual(e["scheduled_start_time"], "2026-10-26T08:00:00+00:00")
+        self.assertEqual((e["name"], e["entity_type"], e["privacy_level"]), ("Halloween 2026 — Double Candy Research", 3, 2))
+        self.assertEqual(e["entity_metadata"]["location"], "https://www.pokemonsleep.net/en/news/123/")
+        self.assertIsNone(news.event_payload("123", self.post, now=1793700000), "an event that's over gets none")
+
+    def test_event_is_created_once(self):
+        calls = []
+        def bot(method, path, payload=None):
+            calls.append(method)
+            if method == "GET":
+                return [{"id": "9", "entity_metadata": {"location": "https://www.pokemonsleep.net/en/news/123/"}}] if len(calls) > 2 else []
+            return {"id": "9"}
+        env = {"DISCORD_GUILD_ID": "1", "DISCORD_BOT_TOKEN": "t", "NEWS_EVENT_INVITE": "pokemonsleep"}
+        with patch.dict(os.environ, env), patch.object(news, "_bot", bot), patch.object(news, "_cover", lambda post: None), \
+                patch.object(news.time, "time", lambda: 1792000000):
+            self.assertEqual(news.ensure_event("123", self.post), "https://discord.gg/pokemonsleep?event=9")
+            self.assertEqual(news.ensure_event("123", self.post), "https://discord.gg/pokemonsleep?event=9")
+        self.assertEqual(calls, ["GET", "POST", "GET"], "the second run reused the event")
+
+    def test_no_event_without_a_bot(self):
+        with patch.dict(os.environ, {"DISCORD_GUILD_ID": "", "DISCORD_BOT_TOKEN": ""}):
+            self.assertIsNone(news.ensure_event("123", self.post))
+
+    def test_typed_urls_do_not_unfurl(self):
+        post = news.parse_post(POST.replace("<p># not a heading</p>", "<p>See https://example.com/a_b now</p>"))
+        text = "\n\n".join(v for k, v in post["parts"] if k == "text")
+        self.assertIn("See <https://example.com/a_b> now", text)
 
 
 class SplitTests(unittest.TestCase):

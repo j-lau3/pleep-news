@@ -9,8 +9,14 @@ dropdown as a ### section). A post longer than Discord's 2,000 characters takes
 the fewest messages possible, split at the most natural point (a section first).
 posted.json remembers what was already sent.
 
-Repository variables: NEWS_PING_ROLE_ID (role to ping under the title) and
-NEWS_IMAGES=on (also send the article's images, as separate messages).
+The article's images ride along as embeds on the post's first message
+(NEWS_IMAGES=off to leave them out). With a bot configured, an "Event Period"
+also becomes a Discord scheduled event, linked at the end of the post.
+
+Secrets: NEWS_WEBHOOK_URL; DISCORD_BOT_TOKEN (optional, for events).
+Variables (optional): NEWS_PING_ROLE_ID, NEWS_IMAGES, DISCORD_GUILD_ID,
+NEWS_EVENT_INVITE (the server's invite code, e.g. pokemonsleep, for event links),
+NEWS_EVENT_TZ (time zone for event times, default America/New_York).
 
     python3 news_to_discord.py                 # post new posts (NEWS_WEBHOOK_URL)
     python3 news_to_discord.py --dry-run       # print what would be sent
@@ -22,6 +28,7 @@ With no posted.json yet, a normal run seeds instead of flooding the channel
 with every post on the site.
 """
 import argparse
+import base64
 import html
 import json
 import os
@@ -30,6 +37,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -267,8 +276,11 @@ class _Article(HTMLParser):
     def handle_data(self, data):
         if self.skip:
             return
-        # Source line breaks are just spaces; <br> makes the real ones.
-        self._emit(escape(data.replace("\r", "").replace("\n", " ")))
+        # Source line breaks are just spaces; <br> makes the real ones. A typed URL
+        # is wrapped in <> (no preview) and left unescaped so it stays a link.
+        text = data.replace("\r", "").replace("\n", " ")
+        for n, piece in enumerate(re.split(r"(https?://[^\s<>]+)", text)):
+            self._emit(f"<{piece}>" if n % 2 and not self.link else escape(piece))
 
     def close(self):
         super().close()
@@ -305,7 +317,14 @@ def parse_post(page: str) -> dict:
     parser.feed(body)
     parser.close()
     parts = [(kind, _tidy_bold(value) if kind == "text" else value) for kind, value in parser.parts]
+    period = None
+    at = body.find("Event Period")
+    if at >= 0:
+        times = re.findall(r"data-unixtime=['\"](\d+)['\"]", body[at:at + 1500])
+        if len(times) >= 2:
+            period = (int(times[0]), int(times[1]))
     return {
+        "period": period,
         "title": _text(title[1]),
         "category": _text(category[1]) if category else "",
         "date": _text(date[1]) if date else "",
@@ -370,37 +389,123 @@ def _ping_role() -> str | None:
     return role if role.isdigit() else None
 
 
-def to_messages(post_id: str, post: dict) -> list[dict]:
+def to_messages(post_id: str, post: dict, event_link: str | None = None) -> list[dict]:
     """Webhook payloads in order. The post's text is one message (or the fewest that
-    fit, see _split), with links not previewed. Images go along only with NEWS_IMAGES=on."""
+    fit, see _split) with the event link last; the images ride as embeds on the first
+    message. Links are wrapped in <> so only images and the event card show."""
     title = escape(post["title"]).replace("[", "\\[").replace("]", "\\]")
     role = _ping_role()
-    text = f"# [{title}](<{POST.format(post_id)}>)" + (f"\n<@&{role}>" if role else "")
-    images = os.environ.get("NEWS_IMAGES", "").lower() == "on"
-    messages, header = [], text
-    def flush_text():
-        nonlocal text
-        for chunk in _split(text):
-            messages.append({"content": chunk, "flags": 4})  # 4: no link previews
-        text = ""
+    header = f"# [{title}](<{POST.format(post_id)}>)" + (f"\n<@&{role}>" if role else "")
+    text = header
     for kind, value in post["parts"]:
-        if kind == "image":
-            if images:
-                flush_text()
-                messages.append({"embeds": [{"image": {"url": value}}]})
-        elif not text:
-            text = value
-        elif text == header:
+        if kind != "text":
+            continue
+        if text == header:
             text = f"{text}\n\n{value}"  # a blank line between the title (and ping) and the article
         else:
             # A heading runs straight into what it introduces; other blocks get a blank line.
             heading = text.rsplit("\n", 1)[-1].startswith("#")
             text = f"{text}\n{value}" if heading else f"{text}\n\n{value}"
-    flush_text()
+    if event_link:
+        text = f"{text}\n\n{event_link}"
+    messages = [{"content": chunk} for chunk in _split(text)]
+    if os.environ.get("NEWS_IMAGES", "").lower() != "off":
+        images = [value for kind, value in post["parts"] if kind == "image"][:10]  # Discord's embed limit
+        if images:
+            messages[0]["embeds"] = [{"image": {"url": url}} for url in images]
     for n, m in enumerate(messages):
         # Only the post's first message pings, and only the configured role.
         m["allowed_mentions"] = {"parse": [], "roles": [role]} if role and n == 0 else {"parse": []}
     return messages
+
+
+# --- Discord scheduled events (needs a bot: webhooks can't create events) -------------
+
+API = "https://discord.com/api/v10"
+
+
+def _bot(method: str, path: str, payload: dict | None = None):
+    token = os.environ["DISCORD_BOT_TOKEN"]
+    body = json.dumps(payload).encode() if payload is not None else None
+    for attempt in range(5):
+        req = urllib.request.Request(API + path, data=body, method=method, headers={
+            "Authorization": f"Bot {token}", "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (https://github.com/jlau3/pleep-news, 1)"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read() or b"null")
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(float(json.loads(e.read() or b"{}").get("retry_after", 2)) + 0.5)
+                continue
+            raise RuntimeError(f"Discord bot {e.code}: {e.read()[:300]!r}") from None
+    raise RuntimeError("Discord kept rate limiting the bot")
+
+
+def event_name(post: dict) -> str:
+    return re.sub(r"^Event:\s*", "", post["title"])[:100]
+
+
+def _plain(md: str) -> str:
+    return re.sub(r"\\(.)", r"\1", md.replace("**__", "").replace("__**", "")).replace("<", "").replace(">", "")
+
+
+def event_payload(post_id: str, post: dict, now: float | None = None) -> dict | None:
+    """The scheduled event for a post's Event Period, or None (no period, or already over)."""
+    if not post.get("period"):
+        return None
+    now = time.time() if now is None else now
+    # The game's times are local ("4:00 a.m." wherever you are); the site stores that
+    # wall clock as UTC. A Discord event has one start, so read it in NEWS_EVENT_TZ.
+    zone = ZoneInfo(os.environ.get("NEWS_EVENT_TZ", "").strip() or "America/New_York")
+    local = lambda t: int(datetime.fromtimestamp(t, timezone.utc).replace(tzinfo=zone).timestamp())
+    start, end = (local(t) for t in post["period"])
+    if end <= now + 600:
+        return None
+    start = max(start, int(now) + 300)  # Discord needs a start in the future
+    iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()
+    intro = next((v for k, v in post["parts"] if k == "text" and not v.startswith("#")), "")
+    return {"name": event_name(post), "privacy_level": 2, "entity_type": 3,  # 3: external
+            "scheduled_start_time": iso(start), "scheduled_end_time": iso(end),
+            "entity_metadata": {"location": POST.format(post_id)},
+            "description": (_plain(intro)[:900] + f"\n\n{POST.format(post_id)}")[:1000]}
+
+
+def _cover(post: dict) -> str | None:
+    url = next((v for k, v in post["parts"] if k == "image"), None)
+    if not url:
+        return None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": AGENT})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data, kind = resp.read(8_000_001), resp.headers.get("Content-Type", "image/jpeg").split(";")[0]
+    except (urllib.error.URLError, OSError):
+        return None
+    if len(data) > 8_000_000 or kind not in ("image/jpeg", "image/png", "image/gif"):
+        return None
+    return f"data:{kind};base64," + base64.b64encode(data).decode()
+
+
+def ensure_event(post_id: str, post: dict) -> str | None:
+    """Creates the post's scheduled event once (an existing one for the same post is
+    reused, so retries and re-runs don't duplicate it) and returns its link."""
+    guild = os.environ.get("DISCORD_GUILD_ID", "").strip()
+    if not guild.isdigit() or not os.environ.get("DISCORD_BOT_TOKEN"):
+        return None
+    payload = event_payload(post_id, post)
+    if not payload:
+        return None
+    location = payload["entity_metadata"]["location"]
+    existing = next((e for e in _bot("GET", f"/guilds/{guild}/scheduled-events") or []
+                     if (e.get("entity_metadata") or {}).get("location") == location), None)
+    if existing:
+        event_id = existing["id"]
+    else:
+        cover = _cover(post)
+        event_id = _bot("POST", f"/guilds/{guild}/scheduled-events", {**payload, **({"image": cover} if cover else {})})["id"]
+        print(f"created event: {payload['name']} ({event_id})")
+    invite = os.environ.get("NEWS_EVENT_INVITE", "").strip().removeprefix("https://discord.gg/")
+    return f"https://discord.gg/{invite}?event={event_id}" if invite else f"https://discord.com/events/{guild}/{event_id}"
 
 
 # --- Discord ---------------------------------------------------------------------------
@@ -424,10 +529,15 @@ def send(webhook: str, payload: dict) -> None:
 
 def preview(post_id: str) -> None:
     post = parse_post(fetch(POST.format(post_id)))
-    messages = to_messages(post_id, post)
+    event = event_payload(post_id, post)
+    messages = to_messages(post_id, post, "https://discord.gg/<invite>?event=<new event id>" if event else None)
     print(f"===== {post['title']} ({len(messages)} messages)")
+    if event:
+        print(f"[event] {event['name']}: {event['scheduled_start_time']} to {event['scheduled_end_time']} (created only with a bot configured)")
     for m in messages:
-        print(m.get("content") or f"[image] {m['embeds'][0]['image']['url']}")
+        print(m["content"])
+        for e in m.get("embeds", []):
+            print(f"[image] {e['image']['url']}")
         print("-----")
 
 
@@ -435,7 +545,7 @@ def post_one(post_id: str, webhook: str, start: int = 0, sent=lambda n: None) ->
     """Sends a post's messages from `start` on, calling sent(n) after each, so a run
     that stops partway resumes there instead of repeating the start. Returns the count."""
     post = parse_post(fetch(POST.format(post_id)))
-    messages = to_messages(post_id, post)
+    messages = to_messages(post_id, post, ensure_event(post_id, post))
     for n in range(start, len(messages)):
         send(webhook, messages[n])
         sent(n + 1)
