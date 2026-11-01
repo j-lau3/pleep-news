@@ -2,10 +2,15 @@
 """
 Official Pokémon Sleep news posts, copied word for word into a Discord channel.
 
-Each new post on https://www.pokemonsleep.net/en/news/ becomes a run of webhook
-messages: the title and link, then the article's text as Discord markdown
-(headings, bold, links, the text inside every dropdown) and its images, in the
-order they appear. posted.json remembers what was already sent.
+Each new post on https://www.pokemonsleep.net/en/news/ becomes one webhook
+message in the server's format: the linked title, an optional role ping, then
+the article as Discord markdown (headings, bold-underline, lists, links and every
+dropdown as a ### section). A post longer than Discord's 2,000 characters takes
+the fewest messages possible, split at the most natural point (a section first).
+posted.json remembers what was already sent.
+
+Repository variables: NEWS_PING_ROLE_ID (role to ping under the title) and
+NEWS_IMAGES=on (also send the article's images, as separate messages).
 
     python3 news_to_discord.py                 # post new posts (NEWS_WEBHOOK_URL)
     python3 news_to_discord.py --dry-run       # print what would be sent
@@ -91,8 +96,6 @@ class _Article(HTMLParser):
         self.link: list[tuple[str, int]] = []  # (href, buffer index where the text starts)
         self.skip = 0             # inside script/style
         self.dropdown = 0         # depth of div.news-detail
-        self.group = 0            # which dropdown the text belongs to
-        self.last_group: int | None = None
         self.stack: list[tuple[str, str]] = []  # (tag, class)
         self.in_headline = False
         self.cells: list[str] | None = None
@@ -115,19 +118,10 @@ class _Article(HTMLParser):
         if not lines:
             return
         lines = [_line_start_safe(l) if i or not prefix else l for i, l in enumerate(lines)]
+        lines = [re.sub(r"^[•・]\s*", "- ", l) for l in lines]  # the site's typed bullets become a real list
         if prefix:
             lines[0] = prefix + lines[0]
-        md = "\n".join(lines)
-        if self.dropdown:
-            md = "\n".join("> " + l if l else ">" for l in md.split("\n"))
-            # One quote per dropdown: its headline and text stay together.
-            if self.parts and self.parts[-1][0] == "text" and self.last_group == self.group:
-                self.parts[-1] = ("text", self.parts[-1][1] + "\n" + md)
-                return
-            self.last_group = self.group
-        else:
-            self.last_group = None
-        self.parts.append(("text", md))
+        self.parts.append(("text", "\n".join(lines)))
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -141,12 +135,11 @@ class _Article(HTMLParser):
         if tag == "div" and "news-detail" in cls.split():
             self._flush()
             self.dropdown += 1
-            self.group += 1
             return
         if tag == "div" and "news-detail-headline" in cls.split():
             self._flush()
             self.in_headline = True
-            self._emit("**")
+            self.prefix = "### "  # a dropdown becomes its own ### section
             return
         if tag in self.BLOCKS:
             self._flush()
@@ -218,7 +211,6 @@ class _Article(HTMLParser):
         if self.skip:
             return
         if tag == "div" and "news-detail-headline" in cls.split():
-            self._emit("**")
             self.in_headline = False
             self._flush()
             return
@@ -284,8 +276,9 @@ class _Article(HTMLParser):
 
 
 def _tidy_bold(md: str) -> str:
-    """Discord ignores "** text**": move spaces inside bold markers outside them,
-    drop empty pairs, and keep an unmatched marker literal."""
+    """Bold in the server's format is bold-underline (**__text__**). Discord ignores
+    "** text**", so spaces move outside the markers; empty pairs are dropped and an
+    unmatched marker stays literal."""
     pieces = md.split("**")
     if len(pieces) % 2 == 0:
         pieces[-2:] = [pieces[-2] + "\\*\\*" + pieces[-1]]
@@ -293,7 +286,7 @@ def _tidy_bold(md: str) -> str:
     for inner, after in zip(pieces[1::2], pieces[2::2]):
         core = inner.strip()
         lead, trail = inner[: len(inner) - len(inner.lstrip())], inner[len(inner.rstrip()):]
-        out += lead + (f"**{core}**" if core else "") + trail + after
+        out += lead + (f"**__{core}__**" if core else "") + trail + after
     return out
 
 
@@ -320,47 +313,71 @@ def parse_post(page: str) -> dict:
     }
 
 
-# Where a message may end, best first: before a new section, before a dropdown,
-# between paragraphs, between lines, after a sentence, between words.
-_BREAKS = (r"\n\n(?=#{1,3} )", r"\n\n(?=> \*\*)", r"\n\n", r"\n", r"(?<=[.!?])\s", r"\s")
+# Where a message may break, best first: before a section, before a subsection
+# (a dropdown), between paragraphs, between lines; then, only as a last resort,
+# after a sentence or between words.
+_GOOD_BREAKS = (r"\n\n(?=## )", r"\n\n(?=### )", r"\n\n", r"\n")
+_LAST_RESORT = (r"(?<=[.!?])\s", r"\s")
 
 
-def _cut_point(text: str) -> int:
-    """End of the next message: the best kind of break in the back half of what
-    fits, so messages break naturally without coming out tiny."""
-    for pattern in _BREAKS:
-        cuts = [m.start() for m in re.finditer(pattern, text[: LIMIT + 1]) if LIMIT // 2 <= m.start() <= LIMIT]
-        if cuts:
-            cut = cuts[-1]
-            # A heading or bold subheading at the end moves with the text it introduces.
-            last = text.rfind("\n\n", 0, cut)
-            if last >= LIMIT // 2 and re.fullmatch(r"#.*|\*\*[^\n]*\*\*", text[last + 2:cut].strip()):
-                cut = last
-            return cut
-    return LIMIT
+def _cut(text: str, at: int) -> tuple[str, str]:
+    head, rest = text[:at].rstrip(), text[at:].lstrip("\n ")
+    if head.count("**") % 2:  # don't leave bold open across messages
+        head, rest = head + "__**", "**__" + rest
+    return head, rest
+
+
+def _plan(text: str, n: int, breaks: tuple) -> list[str] | None:
+    """Exactly-n-or-fewer messages using only these kinds of break, each cut the best
+    kind available nearest an even split; None if no such plan exists."""
+    if len(text) <= LIMIT:
+        return [text]
+    if n <= 1:
+        return None
+    lo, ideal = max(1, len(text) - (n - 1) * LIMIT), len(text) / n
+    for pattern in breaks:
+        cuts = [m.start() for m in re.finditer(pattern, text[: LIMIT + 1]) if lo <= m.start() <= LIMIT]
+        for at in sorted(cuts, key=lambda c: abs(c - ideal))[:6]:
+            head, rest = _cut(text, at)
+            later = _plan(rest, n - 1, breaks)
+            if later is not None:
+                return [head] + later
+    return None
 
 
 def _split(text: str) -> list[str]:
-    """Messages of at most LIMIT characters, broken at natural points (_BREAKS)."""
+    """A post is one message when it fits. Otherwise it takes the fewest messages
+    that can all break naturally (a section, then a dropdown, a paragraph, a line);
+    one extra message beats cutting a sentence. Only a post with no natural break
+    at all is cut after a sentence or between words."""
+    least = -(-len(text) // LIMIT)
+    for n in range(least, least + 3):
+        plan = _plan(text, n, _GOOD_BREAKS)
+        if plan:
+            return [c for c in plan if c.strip()]
+    plan = _plan(text, least + 3, _GOOD_BREAKS + _LAST_RESORT)
+    if plan:
+        return [c for c in plan if c.strip()]
     chunks = []
     while len(text) > LIMIT:
-        cut = _cut_point(text)
-        head, text = text[:cut].rstrip(), text[cut:].lstrip("\n ")
-        if head.count("**") % 2:  # don't leave bold open across messages
-            head += "**"
-            text = "**" + text
-        if head.split("\n")[-1].startswith(">") and text and not text.startswith(">"):
-            text = "> " + text  # a dropdown split mid-line stays quoted
+        head, text = _cut(text, LIMIT)
         chunks.append(head)
-    if text.strip():
-        chunks.append(text)
-    return chunks
+    return chunks + ([text] if text.strip() else [])
+
+
+def _ping_role() -> str | None:
+    role = os.environ.get("NEWS_PING_ROLE_ID", "").strip()
+    return role if role.isdigit() else None
 
 
 def to_messages(post_id: str, post: dict) -> list[dict]:
-    """Webhook payloads in order: text messages (links not previewed) and one per image."""
-    header = f"# {escape(post['title'])}\n-# {' · '.join(x for x in (escape(post['category']), escape(post['date'])) if x)} · <{POST.format(post_id)}>"
-    messages, text = [], header
+    """Webhook payloads in order. The post's text is one message (or the fewest that
+    fit, see _split), with links not previewed. Images go along only with NEWS_IMAGES=on."""
+    title = escape(post["title"]).replace("[", "\\[").replace("]", "\\]")
+    role = _ping_role()
+    text = f"# [{title}](<{POST.format(post_id)}>)" + (f"\n<@&{role}>" if role else "")
+    images = os.environ.get("NEWS_IMAGES", "").lower() == "on"
+    messages, header = [], text
     def flush_text():
         nonlocal text
         for chunk in _split(text):
@@ -368,13 +385,21 @@ def to_messages(post_id: str, post: dict) -> list[dict]:
         text = ""
     for kind, value in post["parts"]:
         if kind == "image":
-            flush_text()
-            messages.append({"embeds": [{"image": {"url": value}}]})
+            if images:
+                flush_text()
+                messages.append({"embeds": [{"image": {"url": value}}]})
+        elif not text:
+            text = value
+        elif text == header:
+            text = f"{text}\n\n{value}"  # a blank line between the title (and ping) and the article
         else:
-            text = f"{text}\n\n{value}" if text else value
+            # A heading runs straight into what it introduces; other blocks get a blank line.
+            heading = text.rsplit("\n", 1)[-1].startswith("#")
+            text = f"{text}\n{value}" if heading else f"{text}\n\n{value}"
     flush_text()
-    for m in messages:
-        m["allowed_mentions"] = {"parse": []}
+    for n, m in enumerate(messages):
+        # Only the post's first message pings, and only the configured role.
+        m["allowed_mentions"] = {"parse": [], "roles": [role]} if role and n == 0 else {"parse": []}
     return messages
 
 

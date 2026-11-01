@@ -1,6 +1,8 @@
 """Article rendering, message splitting and listing parsing, on trimmed copies of the official markup."""
 import importlib.util
+import os
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("news", Path(__file__).resolve().parents[1] / "news_to_discord.py")
@@ -82,29 +84,39 @@ class RenderTests(unittest.TestCase):
         self.assertIn("## Outline", text)
         self.assertIn("### Other", text)
         # Bold, with the space Discord needs outside the markers; <br> is a line break.
-        self.assertIn("more **Ghost-type Pokémon**!\nDuring this event, you may even meet **Misdreavus** and", text)
+        self.assertIn("more **__Ghost-type Pokémon__**!\nDuring this event, you may even meet **__Misdreavus__** and", text)
         # Literal markdown characters stay literal.
         self.assertIn(r"\*stars\* or snake\_case.", text)
-        self.assertIn("Event Period:\n• Oct. 26 (Mon) at 4:00 a.m. to Nov. 2 (Mon) at 3:59 a.m.", text)
-        self.assertIn("**Much Greater Appearance Rate**\n**Eevee (Halloween)**, **Misdreavus**, and **Mismagius**", text)
+        self.assertIn("Event Period:\n- Oct. 26 (Mon) at 4:00 a.m. to Nov. 2 (Mon) at 3:59 a.m.", text)
+        self.assertIn("**__Much Greater Appearance Rate__**\n**__Eevee (Halloween)__**, **__Misdreavus__**, and **__Mismagius__**", text)
         self.assertIn("See [this post](<https://www.pokemonsleep.net/en/news/2/>).", text)
         self.assertIn(r"\# not a heading", text)
 
-    def test_dropdown_is_one_quote_with_its_headline(self):
-        quotes = [v for k, v in self.post["parts"] if k == "text" and v.startswith(">")]
-        self.assertEqual(quotes, [
-            "> **Expert Mode Bonuses**\n"
-            "> If you participate in an expert area, the bonuses change.\n"
-            "> • Snorlax’s main favorite Berry will be **Bluk Berries**."
-        ])
+    def test_dropdown_is_a_section_with_its_headline(self):
+        texts = [v for k, v in self.post["parts"] if k == "text"]
+        i = texts.index("### Expert Mode Bonuses")
+        self.assertEqual(texts[i + 1], "If you participate in an expert area, the bonuses change.\n"
+                                       "- Snorlax’s main favorite Berry will be **__Bluk Berries__**.")
 
-    def test_messages(self):
-        messages = news.to_messages("123", self.post)
-        self.assertTrue(messages[0]["content"].startswith("# Event: Halloween 2026 — Double Candy Research\n-# Events · 10/14/2026 · <"))
-        self.assertEqual(messages[1]["embeds"][0]["image"]["url"], "https://view.sleep.pokemon.co.jp/news/image/1/Halloween.jpg")
-        for m in messages:
-            self.assertEqual(m["allowed_mentions"], {"parse": []})
-            self.assertLessEqual(len(m.get("content", "")), news.LIMIT)
+    def test_messages_in_the_server_format(self):
+        with patch.dict(os.environ, {"NEWS_PING_ROLE_ID": "1167529296332595291"}):
+            messages = news.to_messages("123", self.post)
+        self.assertEqual(len(messages), 1, "a post that fits is one message")
+        content = messages[0]["content"]
+        self.assertTrue(content.startswith("# [Event: Halloween 2026 — Double Candy Research](<https://www.pokemonsleep.net/en/news/123/>)\n<@&1167529296332595291>\n\n## Outline\n"))
+        self.assertIn("### Other\n**__Much Greater", content)  # a heading runs straight into its text
+        self.assertNotIn("view.sleep.pokemon.co.jp", content)  # no images unless NEWS_IMAGES=on
+        self.assertEqual(messages[0]["allowed_mentions"], {"parse": [], "roles": ["1167529296332595291"]})
+        self.assertLessEqual(len(content), news.LIMIT)
+
+    def test_no_ping_unless_configured_and_images_only_when_on(self):
+        with patch.dict(os.environ, {"NEWS_PING_ROLE_ID": "", "NEWS_IMAGES": "on"}):
+            messages = news.to_messages("123", self.post)
+        self.assertNotIn("<@&", messages[0]["content"])
+        self.assertEqual(messages[0]["allowed_mentions"], {"parse": []})
+        self.assertEqual([m["embeds"][0]["image"]["url"] for m in messages if "embeds" in m], [
+            "https://view.sleep.pokemon.co.jp/news/image/1/Halloween.jpg",
+            "https://view.sleep.pokemon.co.jp/news/image/1/second.png"])
 
 
 class SplitTests(unittest.TestCase):
@@ -136,10 +148,28 @@ class SplitChoiceTests(unittest.TestCase):
         self.assertTrue(all(len(c) <= news.LIMIT for c in chunks))
         self.assertTrue(chunks[0].endswith("."))
 
-    def test_dropdown_stays_quoted_when_split_mid_line(self):
-        text = "> **Notes**\n> " + "A long note sentence here. " * 120
+    def test_fewest_messages_split_at_a_section(self):
+        para = "word " * 70  # ~350 characters
+        text = "\n\n".join([para] * 4 + ["## Section\n" + para] + [para] * 4)  # ~3,200: two messages
         chunks = news._split(text)
-        self.assertTrue(all(c.startswith(">") for c in chunks))
+        self.assertEqual(len(chunks), 2)
+        self.assertTrue(chunks[1].startswith("## Section"))
+
+    def test_one_message_when_it_fits(self):
+        text = "## A\n" + "word " * 300 + "\n\n## B\n" + "word " * 50
+        self.assertEqual(news._split(text), [text])
+
+    def test_long_post_takes_the_fewest_messages_that_break_naturally(self):
+        para = ("word " * 69 + "end.").strip()
+        text = "\n\n".join([para] * 16)  # ~5,700: 3 would cut a paragraph, so 4
+        chunks = news._split(text)
+        self.assertEqual(len(chunks), 4)
+        self.assertTrue(all(len(c) <= news.LIMIT for c in chunks))
+        self.assertTrue(all(set(c.split("\n\n")) == {para} for c in chunks), "a paragraph was cut")
+
+    def test_unbreakable_text_still_fits(self):
+        chunks = news._split("x" * 4500)
+        self.assertTrue(len(chunks) == 3 and all(len(c) <= news.LIMIT for c in chunks))
 
 
 class RunTests(unittest.TestCase):
