@@ -460,6 +460,8 @@ def event_payload(post_id: str, post: dict, now: float | None = None) -> dict | 
     zone = ZoneInfo(os.environ.get("NEWS_EVENT_TZ", "").strip() or "America/New_York")
     local = lambda t: int(datetime.fromtimestamp(t, timezone.utc).replace(tzinfo=zone).timestamp())
     start, end = (local(t) for t in post["period"])
+    if end % 60 == 59:
+        end += 1  # "3:59 a.m." ends at 4:00, as the server's events have always shown it
     if end <= now + 600:
         return None
     start = max(start, int(now) + 300)  # Discord needs a start in the future
