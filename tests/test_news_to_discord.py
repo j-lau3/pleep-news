@@ -144,7 +144,7 @@ class RenderTests(unittest.TestCase):
             return {"id": "9"}
         env = {"DISCORD_GUILD_ID": "1", "DISCORD_BOT_TOKEN": "t", "NEWS_EVENT_INVITE": "pokemonsleep"}
         with patch.dict(os.environ, env), patch.object(news, "_bot", bot), patch.object(news, "_cover", lambda post: None), \
-                patch.object(news.time, "time", lambda: 1792000000):
+                patch.object(news.time, "time", lambda: 1792000000), patch("builtins.print"):  # a fake bot: keep the real run's log clean
             self.assertEqual(news.ensure_event("123", self.post), "https://discord.gg/pokemonsleep?event=9")
             self.assertEqual(news.ensure_event("123", self.post), "https://discord.gg/pokemonsleep?event=9")
         self.assertEqual(calls, ["GET", "POST", "GET"], "the second run reused the event")
