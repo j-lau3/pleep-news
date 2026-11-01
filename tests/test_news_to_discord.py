@@ -131,7 +131,9 @@ class RenderTests(unittest.TestCase):
             e = news.event_payload("123", self.post, now=1792000000)
         # Oct. 26 at 4:00 a.m. New York time (EDT), not 4:00 UTC.
         self.assertEqual(e["scheduled_start_time"], "2026-10-26T08:00:00+00:00")
-        self.assertEqual((e["name"], e["entity_type"], e["privacy_level"]), ("Halloween 2026 — Double Candy Research", 3, 2))
+        self.assertEqual((e["name"], e["entity_type"], e["privacy_level"]), ("Event: Halloween 2026 — Double Candy Research", 3, 2))
+        self.assertTrue(e["description"].endswith("\n\nFor more information: https://www.pokemonsleep.net/en/news/123/"))
+        self.assertTrue(e["description"].startswith("This week-long event is a special opportunity"))
         self.assertEqual(e["entity_metadata"]["location"], "https://www.pokemonsleep.net/en/news/123/")
         self.assertIsNone(news.event_payload("123", self.post, now=1793700000), "an event that's over gets none")
 

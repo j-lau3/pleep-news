@@ -443,7 +443,7 @@ def _bot(method: str, path: str, payload: dict | None = None):
 
 
 def event_name(post: dict) -> str:
-    return re.sub(r"^Event:\s*", "", post["title"])[:100]
+    return post["title"][:100]  # the full title, "Event: New Moon Day #19", as the server names events
 
 
 def _plain(md: str) -> str:
@@ -468,7 +468,8 @@ def event_payload(post_id: str, post: dict, now: float | None = None) -> dict | 
     return {"name": event_name(post), "privacy_level": 2, "entity_type": 3,  # 3: external
             "scheduled_start_time": iso(start), "scheduled_end_time": iso(end),
             "entity_metadata": {"location": POST.format(post_id)},
-            "description": (_plain(intro)[:900] + f"\n\n{POST.format(post_id)}")[:1000]}
+            # As the server writes them: the opening paragraph, then the post's link.
+            "description": _plain(intro)[:900] + f"\n\nFor more information: {POST.format(post_id)}"}
 
 
 def _cover(post: dict) -> str | None:
