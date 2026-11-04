@@ -62,6 +62,13 @@ def _text(fragment: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", fragment))).strip()
 
 
+def unique(listed: list[dict]) -> list[dict]:
+    """Each post once, first appearance kept. The site lists a featured post twice on
+    page 1, and a page can repeat the last post of the one before it."""
+    seen = set()
+    return [p for p in listed if not (p["id"] in seen or seen.add(p["id"]))]
+
+
 def parse_listing(page: str) -> list[dict]:
     """Posts on one listing page, newest first: id, title, category."""
     posts = []
@@ -576,7 +583,7 @@ def save_state(state: dict) -> None:
 def run(listed: list[dict], state: dict, webhook: str, save=save_state) -> int:
     """Sends every listed post not yet posted, oldest first; a burst of posts goes
     out in order, one post after another. Returns how many failed."""
-    new = [p for p in reversed(listed) if p["id"] not in state["posted"]]
+    new = [p for p in reversed(unique(listed)) if p["id"] not in state["posted"]]
     failed = 0
     for p in new:
         pid = p["id"]
@@ -622,6 +629,7 @@ def main() -> int:
     listed = []
     for n in range(1, PAGES + 1):
         listed += parse_listing(fetch(LIST.format(n)))
+    listed = unique(listed)
     if not listed:
         print("news listing had no posts (layout changed?)", file=sys.stderr)
         return 1

@@ -255,6 +255,13 @@ class RunTests(unittest.TestCase):
         news.run(self.listing("c", "b", "a", "old"), state, "hook", self.save)
         self.assertEqual(self.sent, [])
 
+    def test_a_post_listed_twice_goes_out_once(self):
+        # Nov 4: page 1 listed two featured posts twice and page 2 repeated page 1's last.
+        state = {"posted": ["old"], "partial": {}, "failures": {}}
+        news.run(self.listing("c", "b", "c", "b", "a", "a", "old"), state, "hook", self.save)
+        self.assertEqual(self.sent, [(i, n) for i in ("a", "b", "c") for n in range(3)])
+        self.assertEqual(state["posted"], ["old", "a", "b", "c"])
+
     def test_a_post_stopped_partway_resumes_without_repeating(self):
         state = {"posted": [], "partial": {}, "failures": {}}
         self.stop_after["a"] = 2
